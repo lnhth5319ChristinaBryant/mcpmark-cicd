@@ -1,0 +1,237 @@
+name: PR Automation
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint > eslint-results.txt 2>&1 || true
+
+      - name: Run Prettier
+        run: npx prettier --check . > prettier-results.txt 2>&1 || true
+
+      - name: Post Code Quality Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const eslintResults = fs.readFileSync('eslint-results.txt', 'utf8').trim() || 'No ESLint issues found.';
+            const prettierResults = fs.readFileSync('prettier-results.txt', 'utf8').trim() || 'No Prettier formatting issues found.';
+            
+            const comment = `## Code Quality Report
+            ### ESLint Results
+            \`\`\`
+            ${eslintResults}
+            \`\`\`
+            
+            ### Prettier Results
+            \`\`\`
+            ${prettierResults}
+            \`\`\``;
+            
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
+
+  testing-suite:
+    name: Testing Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Tests with Coverage
+        run: npm test -- --coverage
+
+      - name: Upload Coverage Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+      - name: Post Test Coverage Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let coverageSummary = 'No coverage data found.';
+            
+            if (fs.existsSync('coverage/coverage-summary.json')) {
+              const summaryData = JSON.parse(fs.readFileSync('coverage/coverage-summary.json', 'utf8'));
+              coverageSummary = `| Metric | Value |
+              |--------|-------|
+              | Statements | ${summaryData.total.statements.pct}% |
+              | Branches | ${summaryData.total.branches.pct}% |
+              | Functions | ${summaryData.total.functions.pct}% |
+              | Lines | ${summaryData.total.lines.pct}% |`;
+            }
+            
+            const comment = `## Test Coverage Report
+            ${coverageSummary}`;
+            
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Dependency Vulnerability Check
+        run: npm audit --json > npm-audit.json 2>&1 || true
+
+      - name: Secret Scan
+        uses: trufflesecurity/trufflehog@v3.61.0
+        with:
+          path: .
+          output: trufflehog-results.json
+          format: json
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+
+      - name: Post Security Scan Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let npmAudit = 'No dependency vulnerabilities found.';
+            let secretScan = 'No secrets found in code changes.';
+            
+            // Process npm audit results
+            if (fs.existsSync('npm-audit.json')) {
+              const auditData = JSON.parse(fs.readFileSync('npm-audit.json', 'utf8'));
+              if (auditData.advisories && Object.keys(auditData.advisories).length > 0) {
+                npmAudit = `Found ${Object.keys(auditData.advisories).length} vulnerability(ies):\n`;
+                for (const [id, advisory] of Object.entries(auditData.advisories)) {
+                  npmAudit += `- ${advisory.title} (Severity: ${advisory.severity})\n`;
+                }
+              }
+            }
+            
+            // Process secret scan results
+            if (fs.existsSync('trufflehog-results.json')) {
+              const secretData = JSON.parse(fs.readFileSync('trufflehog-results.json', 'utf8'));
+              if (secretData.results && secretData.results.length > 0) {
+                secretScan = `Found ${secretData.results.length} potential secret(s):\n`;
+                for (const result of secretData.results) {
+                  secretScan += `- ${result.kind} in ${result.path}:${result.start_line}\n`;
+                }
+              }
+            }
+            
+            const comment = `## Security Scan Report
+            ### Dependencies
+            \`\`\`
+            ${npmAudit}
+            \`\`\`
+            
+            ### Secret Scan
+            \`\`\`
+            ${secretScan}
+            \`\`\``;
+            
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
+
+  build-validation:
+    name: Build Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Application
+        run: npm run build
+
+      - name: Start Server
+        run: npm start &
+
+      - name: Wait for Server
+        run: npx wait-on http://localhost:3000
+
+      - name: Validate Endpoints
+        run: |
+          echo "Checking root endpoint..."
+          curl -f http://localhost:3000
+          echo "\nChecking health endpoint..."
+          curl -f http://localhost:3000/api/health
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact
+          path: dist/
+          retention-days: 7
+
+      - name: Post Build Validation Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = `## Build Validation
+            ✅ Application built successfully!
+            ✅ All endpoints are accessible (root and /api/health)
+            📦 Build artifact has been uploaded for review`;
+            
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
